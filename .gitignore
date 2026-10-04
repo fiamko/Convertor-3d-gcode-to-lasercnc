@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.lnk
+*.nc
+!examples/*.nc
+PROJECT_NOTES.md
+README_LOCAL.md
+publish_*.json
+*.zip
+.env
+.env.*
