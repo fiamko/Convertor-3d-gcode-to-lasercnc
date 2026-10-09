@@ -11,3 +11,7 @@ publish_*.json
 *.zip
 .env
 .env.*
+
+.build-tools/
+build/
+dist/

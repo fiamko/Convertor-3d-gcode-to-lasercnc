@@ -14,6 +14,7 @@ class Stroke:
     burn: bool
     feed: float = 0
     power: float = 0
+    rapid: bool = True
 
 
 @dataclass
@@ -23,6 +24,7 @@ class Drawing:
     mode: str = ""
     pauses: dict = field(default_factory=dict)
     drill_points: list = field(default_factory=list)
+    reference_bounds: tuple | None = None
 
     def bounds(self):
         pts = [p for s in self.strokes if s.burn for p in s.points]
@@ -246,10 +248,10 @@ def parse_nc(text, mode='auto', threshold=0.0, drill_diameter=0.0):
                         last = drawing.strokes[-1] if drawing.strokes else None
                         if (not split and len(drawing.strokes) not in drawing.pauses
                                 and last and last.burn == burn and last.feed == feed
-                                and last.power == power and last.points[-1] == start):
+                                and last.power == power and last.rapid == (motion == 0) and last.points[-1] == start):
                             last.points.extend(points[1:])
                         else:
-                            drawing.strokes.append(Stroke(points, burn, feed, power))
+                            drawing.strokes.append(Stroke(points, burn, feed, power, motion == 0))
                 split = False
             if 'Z' in vals and z != nz:
                 split = True
@@ -277,6 +279,8 @@ def parse_nc(text, mode='auto', threshold=0.0, drill_diameter=0.0):
 
 def merge_drawings(drawings):
     """Join independent documents, preserving absolute coordinates and operation order."""
+    drawings = list(drawings)
+    if not drawings: raise NCError('Žádné vstupní výkresy ke spojení.')
     merged = Drawing(mode='spojené soubory')
     for drawing in drawings:
         offset = len(merged.strokes)
@@ -285,6 +289,8 @@ def merge_drawings(drawings):
         merged.strokes.extend(drawing.strokes)
         merged.drill_points.extend(drawing.drill_points)
         merged.warnings.extend(drawing.warnings)
+    boxes = [d.reference_bounds or d.bounds() for d in drawings]
+    merged.reference_bounds = (min(b[0] for b in boxes),min(b[1] for b in boxes),max(b[2] for b in boxes),max(b[3] for b in boxes))
     merged.bounds()
     return merged
 
@@ -305,7 +311,7 @@ def export_nc(drawing, feed, power, mirror_x=False, mirror_y=False, laser='M3', 
         raise NCError("Režim laseru musí být M3 nebo M4.")
     if rotation not in (0,90,180,270):
         raise NCError("Otočení musí být 0, 90, 180 nebo 270 stupňů.")
-    bounds = drawing.bounds()
+    bounds = drawing.reference_bounds or drawing.bounds()
     def transform(p):
         x = bounds[0] + bounds[2] - p[0] if mirror_x else p[0]
         y = bounds[1] + bounds[3] - p[1] if mirror_y else p[1]
@@ -346,37 +352,227 @@ def export_nc(drawing, feed, power, mirror_x=False, mirror_y=False, laser='M3', 
     return '\n'.join(out)
 
 
+def negative_fill_lines(width, diameter):
+    """Fixed edge offsets and 80% steps inward; only the centre is exceptional."""
+    positive(width, 'Šířka spoje')
+    positive(diameter, 'Rozteč čar')
+    if diameter < .001:
+        raise NCError('Rozteč čar musí být alespoň 0,001 mm.')
+    if width < diameter - 1e-9:
+        raise NCError('Šířka spoje nesmí být menší než D (Rozteč čar). Zmenšete D.')
+    if width / diameter > 50000:
+        raise NCError('Příliš hustý obrazec; zvětšete rozteč čar.')
+    left, right = diameter / 2, width - diameter / 2
+    lines = [left]
+    if right - left <= 1e-9:
+        return lines
+    lines.append(right)
+    step = .8 * diameter
+    while right - left > diameter + 1e-9:
+        if right - left <= 2 * step + 1e-9:
+            lines.append((left + right) / 2)
+            break
+        left += step
+        right -= step
+        lines.extend((left, right))
+    return sorted(lines)
+
+
 def test_pattern(x, y, width, height, columns, rows, gap, spacing,
-                 min_power, max_power, min_feed, max_feed, laser='M3'):
+                 min_power, max_power, min_feed, max_feed, laser='M3', trace_widths=None,
+                 trace_pass_mode=None, border_count=0, border_width=.2, negative=False, negative_gap=.5):
     for v, label in ((width, 'Šířka'), (height, 'Výška'), (spacing, 'Rozteč čar'),
                      (min_power, 'Výkon od'), (max_power, 'Výkon do'),
                      (min_feed, 'Rychlost od'), (max_feed, 'Rychlost do')):
         positive(v, label)
     positive(gap, 'Mezera', zero=True)
     if not all(math.isfinite(v) for v in (x, y)):
-        raise NCError("Neplatný počátek obrazce.")
+        raise NCError('Neplatný počátek obrazce.')
     if not 1 <= columns <= 20 or not 1 <= rows <= 20:
-        raise NCError("Počet řádků a sloupců musí být 1 až 20.")
+        raise NCError('Počet řádků a sloupců musí být 1 až 20.')
     if max_power < min_power or max_feed < min_feed:
-        raise NCError("Horní mez musí být větší nebo rovna dolní.")
+        raise NCError('Horní mez musí být větší nebo rovna dolní.')
+    if trace_pass_mode not in (None,'adjacent'):
+        raise NCError('Neplatný režim průjezdů.')
+    if laser not in ('M3', 'M4'): raise NCError('Neplatný režim laseru.')
     cw, ch = (width - (columns-1)*gap)/columns, (height - (rows-1)*gap)/rows
     if cw <= 0 or ch <= 0:
-        raise NCError("Zadané mezery se nevejdou do plochy obrazce.")
-    if rows * columns * (int(ch / spacing) + 1) > 50000:
-        raise NCError("Příliš hustý obrazec; zvětšete rozteč čar.")
-    out = ['(PrevodnikNC - test matrix, columns S / rows F)', 'G21', 'G90', 'G17', 'G94', 'M5']
-    legend = []
-    if laser not in ('M3', 'M4'): raise NCError('Neplatný režim laseru.')
+        raise NCError('Zadané mezery se nevejdou do plochy obrazce.')
+    if type(border_count)!=int or border_count not in (0,1,2):
+        raise NCError('Počet obrysů musí být 0, 1 nebo 2.')
+    if negative:
+        trace_pass_mode=None
+    margin=0
+    if border_count:
+        positive(border_width,'Šířka stopy obrysu')
+        if border_width<.001: raise NCError('Šířka stopy obrysu musí být alespoň 0,001 mm.')
+        border_step=.8*border_width
+        margin=(border_count-1)*border_step+border_width/2
+    # Reserve the whole nominal beam footprint inside the requested area.
+    if not negative and border_count and (rows>1 or columns>1) and gap+1e-9<2*margin:
+        raise NCError(f'Obrysy se nevejdou do oddělení polí. Zvětšete mezeru polí alespoň na {math.ceil(2*margin*100)/100:g} mm.')
+    if negative:
+        # Each frame fits inside its own fixed cell; never enlarge the board.
+        cell_width,cell_height=cw,ch
+        cw-=2*margin; ch-=2*margin
+    else:
+        cw-=2*margin/columns; ch-=2*margin/rows
+        cell_width,cell_height=cw,ch
+    if min(cw,ch)<=0: raise NCError('Obrys se nevejde do pole; zvětšete plochu nebo zmenšete šířku stopy obrysu.')
+    trace_widths = tuple(trace_widths or ())
+    if trace_pass_mode and not trace_widths: raise NCError('Porovnání průjezdů vyžaduje šířky spojů.')
+    if len(trace_widths)>12: raise NCError('Zadejte nejvýše 12 šířek spojů.')
+    for value in trace_widths:
+        positive(value,'Šířka spoje')
+        if value<.0001: raise NCError('Šířka spoje je menší než přesnost výstupu 0,0001 mm.')
+    notes=[]; groups=[]
+    if negative:
+        if not trace_widths:
+            raise NCError('Negativní test vyžaduje šířky spojů.')
+        positive(negative_gap, 'Mezera sloupečků', zero=True)
+        length=(cw-(len(trace_widths)-1)*negative_gap)/len(trace_widths)
+        if length <= spacing:
+            raise NCError('Sloupečky se nevejdou do šířky pole. Zmenšete jejich mezeru, D nebo počet šířek spojů.')
+        notes=['(Negativni rezist: laser osvituje budouci med.)',
+               '(Sirky sloupecku zleva v mm: '+' / '.join(fmt(v) for v in trace_widths)+')',
+               f'(Plocha {fmt(width)} x {fmt(height)} mm; pole {fmt(cell_width)} x {fmt(cell_height)} mm.)',
+               f'(Prostor uvnitr ramu {fmt(cw)} x {fmt(ch)} mm; mezera sloupecku {fmt(negative_gap)} mm.)',
+               '(Kazdy sloupecek: mezera W, obdelnik W, mezera W; opakovani po cele vysce.)',
+               '(Neuplny horni obdelnik se vynecha; posledni horni mezera neni porovnavaci.)',
+               f'(D {fmt(spacing)} mm; osy D/2 dovnitr od hran; pevny krok {fmt(.8*spacing)} mm; prekryti 20 procent.)',
+               '(Vypln od obou hran; zbyvajici vzdalenost os <= D bez dalsi drahy, > D doplnena uprostred.)',
+               f'(Nominalni delka obdelniku {fmt(length)} mm; delka drahy {fmt(length-spacing)} mm.)']
+        total=0
+        for index, trace_width in enumerate(trace_widths):
+            offsets=negative_fill_lines(trace_width, spacing)
+            repeats=math.floor((ch+1e-9)/(2*trace_width))
+            if repeats < 1:
+                raise NCError(f'Spoj {fmt(trace_width)} mm se do výšky pole nevejde ani jednou s dolní mezerou. Zmenšete počet řádků nebo šířku spoje.')
+            total+=repeats*len(offsets)
+            if rows*columns*total>50000:
+                raise NCError('Příliš hustý obrazec; zvětšete rozteč čar.')
+            notes.append(f'(Sloupecek {index+1}: W {fmt(trace_width)} mm / mezera {fmt(trace_width)} mm / obdelniku {repeats} / drah na obdelnik {len(offsets)} / osy od dolni hrany: '+
+                         ' / '.join(fmt(v) for v in offsets)+')')
+            for repeat in range(repeats):
+                base=(2*repeat+1)*trace_width
+                groups.append((f'W{fmt(trace_width)} vzorek {repeat+1}',index*(length+negative_gap)+spacing/2,length-spacing,
+                               [base+v for v in offsets],False))
+    elif trace_widths:
+        notes=['(Test spoju: vodorovne zbytky medi; sirky zdola nahoru v mm)',
+               '('+' / '.join(fmt(v) for v in trace_widths)+')',
+               '(Sirky jsou nominalni sirky medi; prvni osa je vne hrany o polovinu zadane roztece.)']
+        if trace_pass_mode:
+            separation=max(.5,2*spacing)
+            length=(cw-2*separation)/3
+            if length<2:
+                minimum=columns*(6+2*separation)+(columns-1)*gap+2*margin
+                raise NCError(f'Porovnání 1/2/3 se nevejde. Zvětšete šířku plochy alespoň na {math.ceil(minimum*100)/100:g} mm.')
+            step=.8*spacing
+            extent=spacing/2+2*step
+            # Reserve nominal footprints and .3 mm clear space between rectangles.
+            required=sum(trace_widths)+len(trace_widths)*(2*extent+spacing)+(len(trace_widths)-1)*.3
+            if ch<required:
+                minimum=rows*required+(rows-1)*gap+2*margin
+                raise NCError(f'Vodorovné spoje se nevejdou. Zvětšete výšku plochy alespoň na {math.ceil(minimum*100)/100:g} mm.')
+            notes+=['(V kazdem poli tri vzorky zleva: 1 / 2 / 3 prujezdy)',
+                    '(Prvni osa od hrany '+fmt(spacing/2)+' mm; dalsi drahy krok '+fmt(step)+' mm; prekryti 20 procent)']
+            notes+=['(Kazdy obdelnik ma vlastni sadu drah pod i nad sebou.)',
+                    '(Mezi nominalnimi stopami sousednich sad zustava 0.3 mm; drahy se nesdileji.)']
+            for passes in (1,2,3):
+                # Identical nominal copper rectangles in all three columns.
+                bottom=(ch-required)/2+spacing/2+extent
+                lines=[]
+                for trace_width in trace_widths:
+                    top=bottom+trace_width
+                    lines.extend(sorted(bottom-spacing/2-n*step for n in range(passes)))
+                    lines.extend(top+spacing/2+n*step for n in range(passes))
+                    bottom=top+2*extent+spacing+.3
+                groups.append((f'P{passes}',(passes-1)*(length+separation),length,lines,False))
+        else:
+            step=.8*spacing
+            lane=(ch-sum(trace_widths)-len(trace_widths)*spacing)/(len(trace_widths)+1)
+            if lane<2*spacing:
+                minimum=rows*(sum(trace_widths)+len(trace_widths)*spacing+(len(trace_widths)+1)*2*spacing)+(rows-1)*gap+2*margin
+                raise NCError(f'Spoje a mezery se nevejdou do polí. Zvětšete výšku plochy alespoň na {math.ceil(minimum*100)/100:g} mm.')
+            if columns*rows*((ch-sum(trace_widths))/spacing+2*(len(trace_widths)+1))>50000:
+                raise NCError('Příliš hustý obrazec; zvětšete rozteč čar.')
+            lines=[]; bottom=0
+            for index in range(len(trace_widths)+1):
+                top=bottom+lane
+                lines.extend(bottom+n*step for n in range(math.floor(lane/step)+1))
+                if top-lines[-1]>.00005: lines.append(top)
+                if index<len(trace_widths): bottom=top+trace_widths[index]+spacing
+            groups=[('rastr',0,cw,lines,True)]
+    else:
+        if rows*columns*(int(ch/spacing)+1)>50000:
+            raise NCError('Příliš hustý obrazec; zvětšete rozteč čar.')
+        groups=[('plocha',0,cw,[n*spacing for n in range(int(ch/spacing)+1)],True)]
+    if rows*columns*sum(len(g[3]) for g in groups)>50000:
+        raise NCError('Příliš hustý obrazec; zvětšete rozteč čar.')
+    if border_count:
+        notes += [f'(Oddeleni celeho pole S/F: {border_count} uzavrene obrysy, prekryti stop 20 procent)',
+                  f'(Sirka stopy obrysu {fmt(border_width)} mm; roztec obrysu {fmt(border_step)} mm)',
+                  ('(Ram pouze kolem celeho S/F pole.)' if negative else '(Vnitrni propojeni vzorku 1/2/3 zustavaji zachovana.)'),
+                  '(Vnejsi obrysy vcetne zadane sirky stopy zustavaji uvnitr zadane plochy.)']
+    out=['(PrevodnikNC - test matrix, columns S / rows F)','G21','G90','G17','G94','M5']
+    legend=[]
     for row in range(rows):
-        feed = min_feed + (max_feed-min_feed)*row/max(1, rows-1)
+        feed=min_feed+(max_feed-min_feed)*row/max(1,rows-1)
         for col in range(columns):
-            power = min_power + (max_power-min_power)*col/max(1, columns-1)
-            xx, yy = x + col*(cw+gap), y + row*(ch+gap)
-            label = f'R{row+1} C{col+1}: S{fmt(power)} / F{fmt(feed)}'
-            legend.append(label)
-            out.append(f'({label})')
-            for n in range(int(ch/spacing)+1):
-                a, b = (xx, xx+cw) if n % 2 == 0 else (xx+cw, xx)
-                out += [f'G0 X{fmt(a)} Y{fmt(yy+n*spacing)}', f'{laser} S{fmt(power)}',
-                        f'G1 X{fmt(b)} Y{fmt(yy+n*spacing)} F{fmt(feed)}', 'M5']
-    return '\n'.join(out + ['M2', '']), legend
+            power=min_power+(max_power-min_power)*col/max(1,columns-1)
+            xx,yy=x+col*(cell_width+gap)+margin,y+row*(cell_height+gap)+margin
+            label=f'R{row+1} C{col+1}: S{fmt(power)} / F{fmt(feed)}'
+            legend.append(label); out.append(f'({label})')
+            for group,offset,length,lines,zigzag in groups:
+                if trace_pass_mode or negative: out.append(f'({label} / {group})')
+                for n,line_y in enumerate(lines):
+                    a,b=(xx+offset,xx+offset+length)
+                    if zigzag and n%2: a,b=b,a
+                    out += [f'G0 X{fmt(a)} Y{fmt(yy+line_y)}',f'{laser} S{fmt(power)}',
+                            f'G1 X{fmt(b)} Y{fmt(yy+line_y)} F{fmt(feed)}','M5']
+            if border_count:
+                # Exactly one perimeter set per entire S/F cell, never around
+                # its three sub-samples: the internal bridges are intentional.
+                for ring in range(border_count):
+                    delta=ring*border_step
+                    left,right=xx-delta,xx+cw+delta
+                    bottom,top=yy-delta,yy+ch+delta
+                    out += [f'({label} / obrys celeho pole {ring+1})',
+                            f'G0 X{fmt(left)} Y{fmt(bottom)}',f'{laser} S{fmt(power)}',f'G1 F{fmt(feed)}',
+                            f'G1 X{fmt(right)} Y{fmt(bottom)}',f'G1 X{fmt(right)} Y{fmt(top)}',
+                            f'G1 X{fmt(left)} Y{fmt(top)}',f'G1 X{fmt(left)} Y{fmt(bottom)}','M5']
+    header=['(Rozpis testu: sloupce zleva S, radky zdola F; F v mm/min)']+notes+[f'({label})' for label in legend]
+    return '\n'.join(header+out+['M2','']),legend
+
+
+def drawing_statistics(drawing, rapid_feed):
+    """Lengths in mm and ideal XY seconds; unknown initial approach and pauses excluded."""
+    positive(rapid_feed, 'Rychlost G0')
+    burn = travel = seconds = 0.0
+    count = 0
+    unknown = False
+    for stroke in drawing.strokes:
+        length = sum(math.dist(a,b) for a,b in zip(stroke.points,stroke.points[1:]))
+        if stroke.burn:
+            burn += length
+            count += int(length > 0)
+            if length and stroke.feed <= 0: unknown = True
+            elif length: seconds += length / stroke.feed * 60
+        else:
+            travel += length
+            if length and not stroke.rapid and stroke.feed <= 0: unknown = True
+            elif length: seconds += length / (rapid_feed if stroke.rapid else stroke.feed) * 60
+    return burn,travel,count,None if unknown else seconds
+
+
+def check_alignment(base, candidate):
+    """Extent screening only: NC contours do not prove copper/pad identity."""
+    if not candidate.drill_points:
+        return 'gray','Soubor nemá rozpoznané vrtací body. Shodu ověřte v překrytém náhledu.'
+    if not any(s.burn for s in base.strokes):
+        return 'gray','Chybí pracovní obrysy pro porovnání vrtání.'
+    x0,y0,x1,y1 = base.bounds()
+    outside = sum(not (x0-.5 <= x <= x1+.5 and y0-.5 <= y <= y1+.5) for x,y in candidate.drill_points)
+    if outside:
+        return 'red',f'Podezření na nesoulad: {outside} z {len(candidate.drill_points)} otvorů leží mimo rozsah obrysů (tolerance 0,5 mm). Ověřte soubor, počátek a orientaci.'
+    return 'amber',f'{len(candidate.drill_points)} otvorů je v rozsahu obrysů. Zrcadlení ani správnost desky tím nejsou potvrzeny — ověřte překrytí.'

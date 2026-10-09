@@ -10,5 +10,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m unittest -v test_nc_core
+      - run: python -m unittest -v test_nc_core test_features test_contours test_negative test_preferences
       - run: python test_gui_smoke.py
+      - run: python test_contour_gui.py
+      - run: python test_preview_fit.py
