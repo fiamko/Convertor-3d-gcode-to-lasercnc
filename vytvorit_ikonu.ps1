@@ -59,10 +59,15 @@ foreach ($bytes in $iconImages) { $writer.Write([byte[]]$bytes) }
 $writer.Dispose(); $file.Dispose()
 $shortcutShell = New-Object -ComObject WScript.Shell
 $shortcut = $shortcutShell.CreateShortcut((Join-Path $iconRoot 'PrevodnikNC.lnk'))
-$shortcut.TargetPath = Join-Path $iconRoot 'spustit_PrevodnikNC.cmd'
+$portableExe = Join-Path $iconRoot 'dist\PrevodnikNC.exe'
+if (Test-Path -LiteralPath $portableExe) {
+    $shortcut.TargetPath = $portableExe
+} else {
+    $shortcut.TargetPath = Join-Path $iconRoot 'PrevodnikNC.pyw'
+}
 $shortcut.WorkingDirectory = $iconRoot
 $shortcut.IconLocation = (Join-Path $iconRoot 'PrevodnikNC.ico') + ',0'
-$shortcut.Description = 'PrevodnikNC - PCB a laser'
+$shortcut.Description = 'PrevodnikNC - PCB, laser a CNC'
 $shortcut.WindowStyle = 7
 $shortcut.Save()
 Write-Output 'Created PrevodnikNC.ico, PrevodnikNC.png and PrevodnikNC.lnk in the project directory.'

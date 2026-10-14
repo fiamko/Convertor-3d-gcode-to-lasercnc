@@ -15,3 +15,8 @@ publish_*.json
 .build-tools/
 build/
 dist/
+
+# Local manufacturing data and UI reference; never part of application releases.
+pcb_0R/
+pcb_review_v7/
+prevodnik_navrh.jpg

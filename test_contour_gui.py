@@ -30,8 +30,10 @@ with tempfile.TemporaryDirectory() as temp:
         assert len(dialog.selected)==2
         dialog.count.set('2'); dialog.choose_layers(); assert len(dialog.selected)==4
         dialog.preview.draw()
-        assert any(dialog.preview.canvas.gettags(i) and dialog.preview.canvas.itemcget(i,'fill')=='#da7800' for i in dialog.preview.canvas.find_all())
+        assert any(dialog.preview.canvas.gettags(i) and dialog.preview.canvas.itemcget(i,'fill')=='#cc2535' for i in dialog.preview.canvas.find_all())
         dialog.commit_selection(); root.update()
+        assert app.code.get('1.0','end-1c')
+        assert sum(s.burn for s in app.after.drawing.strokes)==2
         assert app.input_code.get('1.0','end-1c')==source
         assert path.read_text()==source
         assert sum(s.burn for s in parse_nc(app.code.get('1.0','end-1c')).strokes)==2
@@ -40,10 +42,30 @@ with tempfile.TemporaryDirectory() as temp:
         assert sum(s.burn for s in app.before.drawing.strokes)==6
         assert len(app.documents[0]['excluded'])==4
         saved=app.code.get('1.0','end-1c')
+        original_mask=set(app.documents[0]['excluded'])
+        app.before.draw()
+        for i,stroke in enumerate(app.before.drawing.strokes):
+            if stroke.burn:
+                assert all(app.before.canvas.itemcget(item,'fill')=='#176b8a' and not app.before.canvas.itemcget(item,'dash')
+                           for item in app.before.canvas.find_withtag(f'stroke:{i}'))
+        with patch('PrevodnikNC.filedialog.askopenfilename',return_value=str(gerber)):
+            app.open_contours()
+        dialog=app.contour_dialog
+        assert dialog.selected==original_mask
+        extra=next(i for i,s in enumerate(dialog.drawing.strokes) if s.burn and i not in original_mask)
+        dialog.toggle(extra); dialog.commit_selection(); root.update()
+        assert set(app.documents[0]['excluded'])==original_mask|{extra}
+        assert sum(s.burn for s in app.after.drawing.strokes)==1
+        with patch('PrevodnikNC.filedialog.askopenfilename',return_value=str(gerber)):
+            app.open_contours()
+        assert app.contour_dialog.selected==original_mask|{extra}
+        app.contour_dialog.toggle(extra); app.contour_dialog.commit_selection(); root.update()
+        assert app.code.get('1.0','end-1c')==saved
         snapshot=read_snapshot(app.recovery_path)
         assert snapshot['output']==saved and len(snapshot['documents'][0]['excluded'])==4
         backup=folder/'saved_session.json'; backup.write_bytes(app.recovery_path.read_bytes())
         app.restore_contours(); root.update()
+        app.convert(confirm=False); root.update()
         assert sum(s.burn for s in parse_nc(app.code.get('1.0','end-1c')).strokes)==6
         with patch('PrevodnikNC.filedialog.askopenfilename',return_value=str(backup)):
             app.restore_work()
@@ -84,13 +106,13 @@ with tempfile.TemporaryDirectory() as temp:
             assert not errors.called
             assert app.documents[0]['excluded']
             assert app.code.get('1.0','end-1c')==saved
-            assert 'Výběr kontur je uložen' in app.status.get()
+            assert 'doplňte platné parametry' in app.status.get()
         app.vars['power'].set('')
         with patch('PrevodnikNC.messagebox.showerror') as errors:
             app.convert()
         assert 'Výkon S' in errors.call_args.args[1]
         app.vars['power'].set('430'); app.convert(); root.update()
-        assert sum(s.burn for s in parse_nc(app.code.get('1.0','end-1c')).strokes)==4
+        assert sum(s.burn for s in parse_nc(app.code.get('1.0','end-1c')).strokes)==2  # Reopening preserves the saved four exclusions.
         # Manual input changes invalidate its index-based selection.
         app.input_code.insert('1.0','; edited\n'); root.update()
         assert not app.documents[0].get('excluded')

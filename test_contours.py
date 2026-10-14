@@ -62,6 +62,27 @@ class Contours(unittest.TestCase):
                      base.replace('C,2','C,2X1'),base.replace('M02*','%SRX2Y2I1J1*%\nM02*')):
             with self.subTest(text=text),self.assertRaises(NCError): parse_copper(text)
 
+    def test_filled_region_with_kicad_cut_in_hole(self):
+        # Outer 10 mm square, inner 2 mm square, retraced bridge to the hole.
+        points=[(0,0),(10,0),(10,10),(0,10),(0,5),(4,5),(4,6),
+                (6,6),(6,4),(4,4),(4,5),(0,5),(0,0)]
+        body='G36*'+''.join(f'X{x*100000}Y{y*100000}D0{2 if i==0 else 1}*'
+                              for i,(x,y) in enumerate(points))+'G37*M02*'
+        c=parse_copper(HEADER+body)
+        self.assertAlmostEqual(c.distance((5,5)),1)  # hole stays clear
+        self.assertAlmostEqual(c.distance((2,5)),-2) # bridge is not a boundary
+        self.assertAlmostEqual(c.distance((10.45,5)),.45)
+        self.assertEqual(copper_outlines(c),[points])
+        # Region boundary ignores the selected aperture's width.
+        wide=parse_copper(HEADER+'%ADD10C,8*%D10*'+body)
+        self.assertAlmostEqual(wide.distance((10.45,5)),.45)
+        for bad in (body.replace('G37*',''),body.replace('G36*','G36*G36*'),
+                    body.replace('G36*','G37*'),body.replace('G37*','X1Y1D01*G37*'),
+                    body.replace('G36*','G36*G02*'),body.replace('G37*','X0Y0D03*G37*')):
+            with self.subTest(bad=bad),self.assertRaises(NCError): parse_copper(HEADER+bad)
+        with self.assertRaisesRegex(NCError,'G38'):
+            parse_copper(HEADER+'G38*M02*')
+
     def test_gerber_arc_directions_modal_state_and_full_circle(self):
         # Upper CCW semicircle, then modal CCW lower semicircle.
         text=HEADER+'%ADD10C,0.2*%D10*X100000Y0D02*G75*G03*X-100000Y0I-100000J0D01*X100000Y0I100000J0D01*G01*X200000Y0D01*M02*'

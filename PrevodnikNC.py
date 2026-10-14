@@ -19,6 +19,17 @@ from tkinter import font as tkfont
 from nc_core import parse_nc, export_nc, test_pattern, merge_drawings, NCError, fmt, drawing_statistics, check_alignment
 
 
+def output_filename(source, cnc=False):
+    """Remove known CAM/export suffixes while retaining the project's own name."""
+    name=Path(source).name if source else 'novy'
+    suffix=re.compile(r'(?:[._-](?:spojene_laser|spojene_cnc|grb_drl|grb_cnc|B_Cu|F_Cu|NPTH|PTH|gcode|nc|gbrl|gbr|grb|gbl|gtl|drl|cnc|laser))$',re.I)
+    while True:
+        trimmed=suffix.sub('',name)
+        if trimmed==name: break
+        name=trimmed
+    return f"{name or 'novy'}-grb_{'cnc' if cnc else 'drl'}.nc"
+
+
 class NCErrorWithDocument(NCError):
     def __init__(self,message,index):
         super().__init__(message)
@@ -200,8 +211,8 @@ class Preview(ttk.Frame):
         self.schedule()
 
     def schedule(self):
-        if self.pending is not None: self.after_cancel(self.pending)
-        self.pending = self.after(25, self.draw)
+        if self.pending is None:
+            self.pending = self.after(25, self.draw)
 
     def zoom(self, event):
         self.initial_fit_pending = False
@@ -224,7 +235,27 @@ class Preview(ttk.Frame):
         self.ox += event.x-x
         self.oy += event.y-y
         self.drag = event.x, event.y
-        self.schedule()
+        self.canvas.move('geometry',event.x-x,event.y-y)
+        self.draw_guides()
+
+    def hit_stroke(self,x,y,radius=7):
+        if not self.drawing: return None
+        ids=set()
+        for item in self.canvas.find_overlapping(x-radius,y-radius,x+radius,y+radius):
+            for tag in self.canvas.gettags(item):
+                if tag.startswith('stroke:'): ids.add(int(tag.split(':')[1]))
+        best=None; distance=radius*radius
+        for index in sorted(ids):
+            stroke=self.drawing.strokes[index]
+            if not stroke.burn: continue
+            for a,b in zip(stroke.points,stroke.points[1:]):
+                ax,ay=self.ox+a[0]*self.scale,self.oy-a[1]*self.scale
+                bx,by=self.ox+b[0]*self.scale,self.oy-b[1]*self.scale
+                dx,dy=bx-ax,by-ay
+                t=max(0,min(1,((x-ax)*dx+(y-ay)*dy)/(dx*dx+dy*dy))) if dx or dy else 0
+                d=(x-ax-t*dx)**2+(y-ay-t*dy)**2
+                if d<distance: best=index; distance=d
+        return best
 
     def draw(self):
         self.pending = None
@@ -234,6 +265,43 @@ class Preview(ttk.Frame):
         if not self.drawing:
             c.create_text(w/2, h/2, text='Náhled drah v milimetrech', fill='#8492a6')
             return
+        for polygon in getattr(self,'copper_polygons',[]):
+            coords=[v for x,y in polygon for v in (self.ox+x*self.scale,self.oy-y*self.scale)]
+            c.create_polygon(*coords,fill='#d2e8cb',outline='',tags=('geometry',))
+        excluded=getattr(self,'excluded_indices',set()) if getattr(self,'show_exclusions',True) else set()
+        for stroke_index,s in enumerate(self.drawing.strokes):
+            if not s.burn and not self.travel.get(): continue
+            if len(s.points) < 2: continue
+            # Whole polylines, split only for Tcl argument size. No skipped segments.
+            for start in range(0, len(s.points)-1, 1500):
+                points = s.points[start:start+1501]
+                coords = [v for x, y in points for v in (self.ox+x*self.scale, self.oy-y*self.scale)]
+                c.create_line(*coords, dash=(3,3) if stroke_index in excluded else (), fill=('#cc2535' if stroke_index in excluded else ('#da7800' if id(s) in getattr(self,'highlight_ids',set()) else '#176b8a')) if s.burn else '#c5cbd2', width=3 if id(s) in getattr(self,'highlight_ids',set()) else (2 if stroke_index in excluded else 1),tags=('geometry',f'stroke:{stroke_index}'))
+        if getattr(self,'show_drills',False):
+            for x,y in self.drawing.drill_points:
+                px,py=self.ox+x*self.scale,self.oy-y*self.scale
+                c.create_line(px-4,py,px+4,py,fill='#8d3d9c',width=2,tags=('geometry',))
+                c.create_line(px,py-4,px,py+4,fill='#8d3d9c',width=2,tags=('geometry',))
+        self.draw_guides()
+
+    def refresh_styles(self):
+        if not self.drawing: return
+        if not self.canvas.find_withtag('geometry'):
+            self.schedule(); return
+        excluded=getattr(self,'excluded_indices',set()) if getattr(self,'show_exclusions',True) else set()
+        highlighted=getattr(self,'highlight_ids',set())
+        for index,stroke in enumerate(self.drawing.strokes):
+            removed=index in excluded
+            focused=id(stroke) in highlighted
+            self.canvas.itemconfigure(f'stroke:{index}',
+                dash=(3,3) if removed else (),
+                fill=('#cc2535' if removed else '#da7800' if focused else '#176b8a') if stroke.burn else '#c5cbd2',
+                width=3 if focused else 2 if removed else 1)
+
+    def draw_guides(self):
+        c=self.canvas
+        c.delete('guides')
+        w,h=c.winfo_width(),c.winfo_height()
         target = 75/self.scale
         base = 10**math.floor(math.log10(target))
         step = next(v*base for v in (1, 2, 5, 10) if v*base >= target)
@@ -242,39 +310,34 @@ class Preview(ttk.Frame):
         xticks, yticks = [], []
         for n in range(math.ceil(xmin/step), math.floor(xmax/step)+1):
             v = n*step; px = self.ox+v*self.scale
-            xticks.append((px, v)); c.create_line(px, 28, px, h, fill='#e3e9ef')
+            xticks.append((px, v)); c.create_line(px, 28, px, h, fill='#e3e9ef',tags=('guides','grid'))
         for n in range(math.ceil(ymin/step), math.floor(ymax/step)+1):
             v = n*step; py = self.oy-v*self.scale
-            yticks.append((py, v)); c.create_line(45, py, w, py, fill='#e3e9ef')
-        c.create_line(self.ox, 28, self.ox, h, fill='#bbc9d8')
-        c.create_line(45, self.oy, w, self.oy, fill='#bbc9d8')
-        for polygon in getattr(self,'copper_polygons',[]):
-            coords=[v for x,y in polygon for v in (self.ox+x*self.scale,self.oy-y*self.scale)]
-            c.create_polygon(*coords,fill='#d2e8cb',outline='')
-        for stroke_index,s in enumerate(self.drawing.strokes):
-            if not s.burn and not self.travel.get(): continue
-            if len(s.points) < 2: continue
-            # Whole polylines, split only for Tcl argument size. No skipped segments.
-            for start in range(0, len(s.points)-1, 1500):
-                points = s.points[start:start+1501]
-                coords = [v for x, y in points for v in (self.ox+x*self.scale, self.oy-y*self.scale)]
-                c.create_line(*coords, fill=('#da7800' if id(s) in getattr(self,'highlight_ids',set()) else '#176b8a') if s.burn else '#c5cbd2', width=1,tags=(f'stroke:{stroke_index}',))
-        c.create_rectangle(0, 0, w, 28, fill='#eaf0f6', outline='')
-        c.create_rectangle(0, 0, 45, h, fill='#eaf0f6', outline='')
+            yticks.append((py, v)); c.create_line(45, py, w, py, fill='#e3e9ef',tags=('guides','grid'))
+        c.create_line(self.ox, 28, self.ox, h, fill='#bbc9d8',tags=('guides','grid'))
+        c.create_line(45, self.oy, w, self.oy, fill='#bbc9d8',tags=('guides','grid'))
+        c.create_rectangle(0, 0, w, 28, fill='#eaf0f6', outline='',tags=('guides',))
+        c.create_rectangle(0, 0, 45, h, fill='#eaf0f6', outline='',tags=('guides',))
         for px, v in xticks:
-            c.create_line(px, 21, px, 28, fill='#61758a')
-            c.create_text(px, 11, text=fmt(v), fill='#3c5369', font=('Segoe UI', 8))
+            c.create_line(px, 21, px, 28, fill='#61758a',tags=('guides',))
+            c.create_text(px, 11, text=fmt(v), fill='#3c5369', font=('Segoe UI', 8),tags=('guides',))
         for py, v in yticks:
-            c.create_line(38, py, 45, py, fill='#61758a')
-            c.create_text(34, py, text=fmt(v), anchor='e', fill='#3c5369', font=('Segoe UI', 8))
-        c.create_rectangle(0, 0, 45, 28, fill='#dce6f0', outline='')
-        c.create_text(22, 14, text='mm', fill='#3c5369')
+            c.create_line(38, py, 45, py, fill='#61758a',tags=('guides',))
+            c.create_text(34, py, text=fmt(v), anchor='e', fill='#3c5369', font=('Segoe UI', 8),tags=('guides',))
+        c.create_rectangle(0, 0, 45, 28, fill='#dce6f0', outline='',tags=('guides',))
+        c.create_text(22, 14, text='mm', fill='#3c5369',tags=('guides',))
+        c.tag_lower('grid')
 
 
-class App:
+
+from milling_ui import MillingMixin
+from milling_core import export_mill, preview_mill
+
+
+class App(MillingMixin):
     def __init__(self, root):
         self.root = root
-        root.title('PrevodnikNC • PCB → LaserGRBL')
+        root.title('Úprava NC • Laser a CNC • verze 0.6')
         icon = Path(__file__).with_suffix('.ico')
         if icon.exists():
             try: root.iconbitmap(str(icon))
@@ -301,9 +364,9 @@ class App:
         self.status = tk.StringVar(value='Otevřete NC soubor. Kolečko: zoom • tažení: posun • dvojklik: celý výkres.')
         head = ttk.Frame(root, padding=(5,2)); head.pack(fill='x')
         ttk.Label(head, text='PrevodnikNC', font=('Segoe UI', 12, 'bold')).pack(side='left')
-        ttk.Label(head, text='PCB / laserový převodník', foreground='#61758a').pack(side='left', padx=20)
+        ttk.Label(head, text='PCB / laser a CNC • 0.5', foreground='#61758a').pack(side='left', padx=20)
         self.recovery_job = None
-        self.recovery_folder = Path(os.environ.get('APPDATA',str(Path.home()))) / 'PrevodnikNC' / 'obnova'
+        self.recovery_folder = Path(os.environ.get('APPDATA',str(Path.home()))) / 'UpravaNC_Laser_CNC' / 'obnova'
         self.recovery_path = self.recovery_folder / (datetime.now().strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:8]+'.json')
         self.recovery_status = tk.StringVar(value='Průběžná obnova připravena')
         ttk.Button(head,text='Obnovit práci…',command=self.restore_work).pack(side='right')
@@ -312,7 +375,10 @@ class App:
         notebook = ttk.Notebook(root); self.notebook = notebook; notebook.pack(fill='both', expand=True, padx=4)
         convert = ttk.Frame(notebook, padding=3); test = ttk.Frame(notebook, padding=3)
         notebook.add(convert, text='  Převod NC  '); notebook.add(test, text='  Test výkonu a rychlosti  ')
-        toolbar = ttk.Frame(convert); toolbar.pack(fill='x')
+        top=ttk.Frame(convert); top.pack(fill='x')
+        left=ttk.Frame(top); left.pack(side='left',fill='both',expand=True)
+        self.convert_right=ttk.Frame(top); self.convert_right.pack(side='right',fill='both',padx=(8,0))
+        toolbar = ttk.Frame(left); toolbar.pack(fill='x')
         ttk.Button(toolbar, text='Otevřít NC…', command=self.open_file).pack(side='left')
         ttk.Button(toolbar, text='Přidat soubor…', command=lambda:self.open_file(add=True)).pack(side='left',padx=3)
         ttk.Label(toolbar,text='Aktivní soubor:').pack(side='left',padx=(8,3))
@@ -321,8 +387,7 @@ class App:
         self.document_choice.bind('<<ComboboxSelected>>',self.select_document)
         ttk.Button(toolbar,text='Odebrat',command=self.remove_document).pack(side='left',padx=3)
         self.filename = PathLabel(toolbar); self.filename.pack(side='left',fill='x',expand=True,padx=6)
-        ttk.Label(convert,text='Aktivní soubor: vstupní editor, uložení vstupu a úpravy kontur. Náhled a Konvert zahrnují všechny načtené soubory.',foreground='#61758a').pack(fill='x')
-        settings = ttk.Frame(convert, padding=3); settings.pack(fill='x', pady=3)
+        settings = ttk.Frame(left, padding=3); settings.pack(fill='x', pady=3)
         self.entry(settings, 'feed', 'Rychlost [mm/min]', '2000', 0, 0)
         self.entry(settings, 'power', 'Výkon S', '', 0, 2)
         self.combo(settings, 'laser', 'Laser', ['M3', 'M4'], 'M3', 0, 4)
@@ -332,33 +397,36 @@ class App:
         self.vars['mx'] = tk.BooleanVar(); self.vars['my'] = tk.BooleanVar()
         ttk.Checkbutton(settings, text='Obrátit X (vlevo ↔ vpravo)', variable=self.vars['mx']).grid(row=2,column=0,columnspan=2,sticky='w')
         ttk.Checkbutton(settings, text='Obrátit Y (dole ↔ nahoře)', variable=self.vars['my']).grid(row=2,column=2,columnspan=2,sticky='w')
-        ttk.Label(settings, text='Otočení zachová levý dolní roh rozsahu drah.', foreground='#61758a').grid(row=2,column=4,columnspan=2,sticky='w')
+        ttk.Label(settings, text='Otočení zachová levý dolní roh rozsahu drah.', wraplength=190, foreground='#61758a').grid(row=2,column=4,columnspan=2,sticky='w')
         self.vars['holes'] = tk.BooleanVar(value=True)
         ttk.Checkbutton(settings,text='Značit vrtací vpichy Z',variable=self.vars['holes']).grid(row=3,column=0,columnspan=2,sticky='w')
         self.entry(settings,'diameter','Průměr značky [mm]','0.3',3,2)
-        ttk.Label(settings,text='Soubory se pálí v pořadí přidání.').grid(row=3,column=4,columnspan=2,sticky='w')
-        actions = ttk.Frame(convert); actions.pack(fill='x', pady=(0,3))
+        ttk.Label(settings,text='CNC značky: svislý vpich, ponor + přídavek.',wraplength=190).grid(row=3,column=4,columnspan=2,sticky='w')
+        actions = ttk.Frame(left); actions.pack(fill='x', pady=(0,3))
         ttk.Button(actions, text='Konvert', command=self.convert).pack(side='left')
         self.save_button = ttk.Button(actions, text='Uložit NC…', command=lambda: self.save(False), state='disabled')
         self.save_button.pack(side='left', padx=8)
         ttk.Button(actions, text='Obnovit vstupní náhled', command=self.load_preview).pack(side='left')
         ttk.Button(actions,text='Ubrat kontury…',command=self.open_contours).pack(side='left',padx=4)
         ttk.Button(actions,text='Vrátit kontury',command=self.restore_contours).pack(side='left')
-        statsbar = ttk.LabelFrame(settings,text='Statistika',padding=4)
-        statsbar.grid(row=0,column=6,rowspan=4,sticky='new',padx=(8,0))
-        settings.columnconfigure(6,weight=1)
+        statsbar = ttk.Frame(self.convert_right,padding=4)
+        self.convert_stats=statsbar
+        statsbar.pack(side='bottom',fill='x',pady=(4,0))
         self.stats = tk.StringVar(value='Statistika: nejprve vytvořte výstup.')
-        ttk.Label(statsbar,textvariable=self.stats,wraplength=330,justify='left').pack(anchor='w')
+        ttk.Label(statsbar,textvariable=self.stats,wraplength=390,justify='left').pack(anchor='w')
         rapidbar=ttk.Frame(statsbar); rapidbar.pack(anchor='w')
         ttk.Label(rapidbar,text='G0 [mm/min]:').pack(side='left')
         self.vars['rapid'] = tk.StringVar(value='3000')
         ttk.Entry(rapidbar,textvariable=self.vars['rapid'],width=12).pack(side='left')
         self.vars['rapid'].trace_add('write',lambda *a:self.update_statistics())
-        ttk.Label(statsbar,text='* Ideální čas XY bez akcelerace, pauz a příjezdu z neznámé polohy. G0 podle stroje.',foreground='#61758a',wraplength=330,justify='left').pack(anchor='w')
+        ttk.Label(statsbar,text='* Ideální čas XY bez akcelerace, pauz a příjezdu z neznámé polohy. G0 podle stroje.',foreground='#61758a',wraplength=390,justify='left').pack(anchor='w')
         self.views = ttk.Notebook(convert); self.views.pack(fill='both', expand=True)
         both = ttk.Panedwindow(self.views, orient='horizontal'); self.views.add(both,text='  Před a po převodu  ')
-        self.before = Preview(both, 'Vstupní NC',show_info=False); self.after = Preview(both, 'Výstup pro LaserGRBL',show_info=False)
+        self.before = Preview(both, 'Vstupní NC',show_info=False); self.after = Preview(both, 'Výstupní NC (laser / CNC)',show_info=False)
         both.add(self.before, weight=1); both.add(self.after, weight=1)
+        # Equal weights distribute only extra space; unequal requested widths
+        # otherwise keep the input pane wider. Centre the divider on resize.
+        both.bind('<Configure>',lambda event: both.sashpos(0,event.width//2))
         editors = ttk.Panedwindow(self.views,orient='horizontal')
         self.editors_tab = editors
         self.views.add(editors,text='  Editory G-code  ')
@@ -370,6 +438,7 @@ class App:
         self.code.bind('<<Modified>>',lambda e:self.editor_changed('output'),add='+')
         self.log = ScrolledText(convert, height=2, wrap='word', font=('Segoe UI', 8), state='disabled')
         self.build_test(test)
+        self.build_milling(settings)
         for key in ('feed','power','laser','mode','threshold','mx','my','rotation','holes','diameter'):
             self.vars[key].trace_add('write', lambda *args: self.invalidate(False))
         for key in ('mode','threshold'):
@@ -377,14 +446,31 @@ class App:
         root.after(80, self.poll)
         root.protocol('WM_DELETE_WINDOW',self.close)
         self.setup_preferences()
+        root.bind('<F1>',self.show_help)
+
+    def show_help(self,event=None):
+        existing=getattr(self,'help_window',None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify(); existing.lift(); return 'break'
+        dialog=tk.Toplevel(self.root); self.help_window=dialog
+        dialog.title('PrevodnikNC 0.6 — Návod / Manual'); dialog.geometry('850x680')
+        book=ttk.Notebook(dialog); book.pack(fill='both',expand=True)
+        for label,name in [('Česky','docs/MANUAL_CS.md'),('English','docs/MANUAL_EN.md'),('Licence / License','LICENSE')]:
+            page=ScrolledText(book,wrap='word',font=('Segoe UI',10),padx=12,pady=10)
+            book.add(page,text=label)
+            try: content=(Path(__file__).resolve().parent/name).read_text(encoding='utf-8')
+            except OSError as exc: content=f'Návod nelze načíst / Cannot read manual: {exc}'
+            page.insert('1.0',content); page.configure(state='disabled')
+        dialog.bind('<Escape>',lambda event:dialog.destroy())
+        return 'break'
 
     def setup_preferences(self):
         self.preferences_path = self.recovery_folder.parent / 'nastaveni.json'
         self.vars['contour_count'] = tk.StringVar(value='1')
-        self.choice_values['contour_count'] = ('1','2')
+        self.choice_values['contour_count'] = ('1','2','3','4')
         self.preference_vars = dict(self.vars)
         self.preference_vars.update(recipe_name=self.recipe_name, recipe_note=self.recipe_note)
-        for name in ('before','after','test_preview'):
+        for name in ('before','after','test_preview','mill_preview'):
             self.preference_vars['travel_'+name] = getattr(self,name).travel
         try:
             data = json.loads(self.preferences_path.read_text(encoding='utf-8'))
@@ -466,11 +552,15 @@ class App:
         try: gerber=Path(path).read_text(encoding='utf-8-sig')
         except (OSError,UnicodeError) as e:
             messagebox.showerror('Gerber',str(e)); return
+        cache_key=(text,mode,threshold,gerber)
         def job():
+            cached=getattr(self,'contour_analysis_cache',None)
+            if cached is not None and cached[0]==cache_key: return drawing,cached[1],cached[2]
             copper=parse_copper(gerber)
             return drawing,copper,analyze_contours(drawing,copper)
         def done(result):
             drawing,copper,analysis=result
+            self.contour_analysis_cache=(cache_key,copper,analysis)
             if self.document_index!=selected_document or self.input_code.get('1.0','end-1c')!=text:
                 self.status.set('Vstup se změnil — spusťte výběr kontur znovu.'); return
             def apply(selected,dialog):
@@ -482,15 +572,21 @@ class App:
                 if not self.documents:
                     self.documents=[{'path':Path('editor.nc'),'text':text,'dirty':True}]
                     self.document_index=0; self.refresh_document_choices()
+                self.manual_history.clear()
                 self.documents[self.document_index]['excluded']=sorted(selected)
                 self.refresh_document_choices()
                 self.revision+=1
                 self.save_recovery()
                 dialog.destroy()
-                self.finish_contour_change(ready)
-            self.contour_dialog=ContourDialog(self,drawing,copper,analysis,Preview,apply)
+                if ready:
+                    self.convert(confirm=False)
+                else:
+                    self.finish_contour_change(ready)
+                    self.status.set('Výběr uložen, výstup zatím nevytvořen: doplňte platné parametry laseru/CNC a stiskněte Konvert.')
+            saved_selection=self.documents[selected_document].get('excluded') if self.documents else None
+            self.contour_dialog=ContourDialog(self,drawing,copper,analysis,Preview,apply,initial_selected=saved_selection)
             self.contour_dialog.title(f'Ubrat kontury — měď: {Path(path).name}')
-            self.status.set(f'Měď: {path}. Zkontrolujte oranžový výběr kontur.')
+            self.status.set(f'Měď: {path}. Červené kontury budou vyřazeny; tlačítko Použít a převést vytvoří výstup.')
         self.run_job(job,done,error_editor=self.input_editor,error_title='Nelze zpracovat kontury / Gerber')
 
     def restore_contours(self):
@@ -499,23 +595,22 @@ class App:
         if not doc.get('excluded'):
             self.status.set('V tomto vstupu nejsou vyřazené kontury.'); return
         ready=self.contour_conversion_ready()
-        if ready and not self.allow_replace(('output',)): return
+        self.manual_history.clear()
         doc.pop('excluded',None); self.revision+=1
         self.refresh_document_choices()
         self.save_recovery()
         self.finish_contour_change(ready)
 
     def contour_conversion_ready(self):
-        try: return self.number('feed')>0 and self.number('power')>0
+        try:
+            if self.vars['cnc'].get():
+                self.mill_values(); return True
+            return self.number('feed')>0 and self.number('power')>0
         except NCError: return False
 
     def finish_contour_change(self, ready):
-        if ready:
-            self.convert(confirm=False)
-        else:
-            self.after.set_drawing(None)
-            self.stats.set('Výstup neaktuální — doplňte Výkon S a Rychlost, potom Konvert.')
-            self.load_preview(status_text='Výběr kontur je uložen. Doplňte kladný Výkon S a Rychlost, potom Konvert. Dosavadní výstup zůstal zachovaný.')
+        self.stats.set('Výběr drah změněn — použijte Konvert. Dosavadní výstup zůstává zachován.')
+        self.load_preview(status_text='Červené dráhy jsou vyřazené. Použijte Konvert pro nový výstup.')
 
     def schedule_recovery(self):
         if not hasattr(self,'recovery_path'): return
@@ -529,9 +624,10 @@ class App:
         self.sync_document()
         input_text=self.input_code.get('1.0','end-1c')
         output=self.code.get('1.0','end-1c'); test=self.test_editor.text.get('1.0','end-1c')
-        if not (self.documents or input_text or output or test): return
+        if not (self.documents or input_text or output or test or self.mill_editor.text.get('1.0','end-1c')): return
         payload={'version':1,'documents':[{**doc,'path':str(doc['path'])} for doc in self.documents],
                  'document_index':self.document_index,'input':input_text,'output':output,'test':test,
+                 'mill':self.mill_editor.text.get('1.0','end-1c'),
                  'settings':{key:var.get() for key,var in self.vars.items()},
                  'recipe_name':self.recipe_name.get(),'recipe_note':self.recipe_note.get()}
         try:
@@ -560,7 +656,7 @@ class App:
                 raise ValueError('Neplatný režim v záloze.')
         except (OSError,ValueError) as e:
             messagebox.showerror('Obnova',str(e)); return
-        if not self.allow_replace(('input','output','test')): return
+        if not self.allow_replace(('input','output','test','mill')): return
         self.save_recovery()
         for key,value in data['settings'].items():
             if key in self.vars: self.vars[key].set(value)
@@ -577,17 +673,19 @@ class App:
         self.dirty['test']=bool(self.test_output); self.test_editor.path.set_path(None)
         self.test_editor.title.configure(text='Testovací G-code • obnoveno')
         self.test_save.configure(state='normal' if self.test_output else 'disabled')
+        self.set_mill_text(data.get('mill',''),bool(data.get('mill','')))
+        self.manual_history.clear()
         self.recipe_name.set(data['recipe_name']); self.recipe_note.set(data['recipe_note'])
         self.refresh_document_choices()
-        for preview in (self.before,self.after,self.test_preview): preview.set_drawing(None)
+        for preview in (self.before,self.after,self.test_preview,self.mill_preview): preview.set_drawing(None)
         self.stats.set('Obnovený text — obnovte náhled pro statistiku.')
         self.revision+=1; self.save_recovery()
         self.status.set('Práce obnovena včetně výběru kontur. Texty lze uložit nebo zkopírovat; náhledy obnovte tlačítkem.')
 
-    RECIPE_KEYS = ('feed','power','laser','mode','threshold','mx','my','rotation','holes','diameter','rapid')
+    RECIPE_KEYS = ('feed','power','laser','mode','threshold','mx','my','rotation','holes','diameter','rapid','cnc','depth','safe','plunge','rpm','delay','drill_extra')
 
     def build_recipes(self, parent):
-        self.recipe_path = Path(os.environ.get('APPDATA', str(Path.home()))) / 'PrevodnikNC' / 'recepty.json'
+        self.recipe_path = Path(os.environ.get('APPDATA', str(Path.home()))) / 'UpravaNC_Laser_CNC' / 'recepty.json'
         self.recipes = {}
         try:
             if self.recipe_path.exists():
@@ -598,6 +696,7 @@ class App:
             self.recipes = {}
             messagebox.showerror('Načtení receptů',str(e))
         bar = ttk.Frame(parent,padding=3); bar.pack(fill='x')
+        ttk.Button(bar,text='Návod / F1',command=self.show_help).pack(side='right',padx=(4,0))
         ttk.Label(bar,text='Technologický recept:').pack(side='left')
         self.recipe_name = tk.StringVar()
         self.recipe_choice = ttk.Combobox(bar,textvariable=self.recipe_name,values=sorted(self.recipes),width=32)
@@ -628,7 +727,8 @@ class App:
         if not name:
             messagebox.showinfo('Recept','Napište název receptu do výběrového pole.'); return
         try:
-            for key in ('feed','power','diameter','rapid'):
+            if self.vars['cnc'].get(): self.mill_values()
+            for key in (('feed','diameter','rapid') if self.vars['cnc'].get() else ('feed','power','diameter','rapid')):
                 if self.number(key) <= 0: raise NCError('Rychlosti, výkon a průměr musí být kladné.')
             self.number('threshold')
         except NCError as e:
@@ -659,7 +759,11 @@ class App:
         try:
             burn,travel,count,seconds = drawing_statistics(self.after.drawing,self.number('rapid'))
             duration = 'neznámý posuv' if seconds is None else f'{int(round(seconds))//60}:{int(round(seconds))%60:02d}'
-            self.stats.set(f'Pálení: {burn/1000:.2f} m | Přejezdy: {travel/1000:.2f} m | Dráhy: {count} | Odhad: {duration}*')
+            text=self.code.get('1.0','end-1c')
+            if '(CNC PCB' in text:
+                self.stats.set(f'Frézování: {burn/1000:.2f} m | Dráhy: {count} | '+self.mill_time(text))
+            else:
+                self.stats.set(f'Pálení: {burn/1000:.2f} m | Přejezdy: {travel/1000:.2f} m | Dráhy: {count} | Odhad: {duration}*')
         except NCError:
             self.stats.set('Pro odhad zadejte kladnou rychlost G0.')
 
@@ -773,11 +877,11 @@ class App:
     def allow_replace(self, sides):
         dirty = [s for s in sides if self.dirty[s]]
         if not dirty: return True
-        names = ', '.join({'input':'vstup','output':'výstup','test':'testovací G-code'}[s] for s in dirty)
+        names = ', '.join({'input':'vstup','output':'výstup','test':'testovací G-code','mill':'test CNC'}[s] for s in dirty)
         return messagebox.askyesno('Neuložené změny',f'Neuložený {names}. Pokračováním se tento text zahodí. Pokračovat?',default='no')
 
     def close(self):
-        if self.allow_replace(('input','output','test')):
+        if self.allow_replace(('input','output','test','mill')):
             self.save_recovery()
             self.save_preferences()
             self.root.destroy()
@@ -793,7 +897,7 @@ class App:
             self.update_statistics()
             self.set_text(self.log,self.report(drawing))
             self.status.set('Výstupní náhled obnoven podle upraveného textu.')
-        self.run_job(lambda:parse_nc(text),done,error_editor=self.output_editor)
+        self.run_job(lambda:preview_mill(text) if '(CNC PCB' in text else parse_nc(text),done,error_editor=self.output_editor)
 
     @staticmethod
     def set_text(widget, text):
@@ -923,14 +1027,16 @@ class App:
         if not self.source: return
         try:
             mode, threshold = self.mode(), self.number('threshold')
-            diameter = self.number('diameter') if self.vars['holes'].get() else 0
+            diameter = self.number('diameter') if self.vars['holes'].get() and not self.vars['cnc'].get() else 0
         except NCError as e: messagebox.showerror('Nastavení',str(e)); return
         documents = self.input_snapshot()
         self.before.set_drawing(None)
         def done(drawing):
             self.before.set_drawing(drawing)
+            self.mark_input_paths()
             self.set_text(self.log, self.report(drawing))
-            self.status.set(status_text or 'Vstup načten. Nastavte výkon, rychlost a případné zrcadlení, pak Konvert.')
+            self.status.set(status_text or 'Vstup načten. Nastavte technologii, parametry a případné zrcadlení, pak Konvert.')
+            self.drill_notice(drawing)
         self.run_job(lambda: self.parse_inputs(documents,mode,threshold,diameter,apply_exclusions=False), done,error_editor=self.input_editor)
 
     @staticmethod
@@ -945,37 +1051,45 @@ class App:
         if self.busy: return
         try:
             mode, threshold = self.mode(), self.number('threshold')
-            feed, power = self.number('feed'), self.number('power')
+            cnc=self.vars['cnc'].get()
+            mill_values=self.mill_values() if cnc else None
+            mark_drills=self.vars['holes'].get()
+            drill_extra=self.number('drill_extra') if cnc else 0
+            feed, power = self.number('feed'), (0 if cnc else self.number('power'))
             mx, my, laser = self.vars['mx'].get(), self.vars['my'].get(), self.vars['laser'].get()
             rotation = int(self.vars['rotation'].get().rstrip('°'))
-            diameter = self.number('diameter') if self.vars['holes'].get() else 0
+            diameter = self.number('diameter') if self.vars['holes'].get() and not self.vars['cnc'].get() else 0
         except NCError as e: messagebox.showerror('Nastavení',str(e)); return
         if confirm and not self.allow_replace(('output',)): return
         self.invalidate(False)
         documents = self.input_snapshot()
         def job():
             drawing = self.parse_inputs(documents,mode,threshold,diameter)
-            output = export_nc(drawing,feed,power,mx,my,laser,rotation=rotation)
+            output = export_mill(drawing,*mill_values,mirror_x=mx,mirror_y=my,rotation=rotation,mark_drills=mark_drills,drill_extra=drill_extra) if cnc else export_nc(drawing,feed,power,mx,my,laser,rotation=rotation)
             original=self.parse_inputs(documents,mode,threshold,diameter,apply_exclusions=False)
-            return original,output,parse_nc(output,'spindle')
+            return original,output,(preview_mill(output) if cnc else parse_nc(output,'spindle'))
         def done(result):
             drawing,self.output,outdrawing = result
             self.before.set_drawing(drawing); self.after.set_drawing(outdrawing)
+            self.mark_input_paths()
             self.update_statistics()
-            self.replace_editor('output',self.output,dirty=True); self.set_text(self.log,self.report(drawing))
+            self.replace_editor('output',self.output,dirty=True); self.capture_output_paths(outdrawing); self.update_statistics(); self.set_text(self.log,self.report(drawing))
             self.output_path = None; self.output_editor.path.set_path(None)
             self.save_button.configure(state='normal')
             self.save_recovery()
             self.status.set('Převedeno. Náhled vpravo je načten přímo z výsledného G-code. Soubor můžete uložit.')
+            self.drill_notice(drawing)
         self.run_job(job,done,error_editor=self.input_editor)
 
     def save(self, test, source=False):
         output = self.test_editor.text.get('1.0','end-1c') if test else (self.input_code if source else self.code).get('1.0','end-1c')
         if not output: return
-        name = 'test_laseru.nc' if test else (self.path.name if source and self.path else
-                self.output_path.name if not source and self.output_path else
-                f'{self.documents[0]["path"].stem}_spojene_laser.nc' if len(self.documents)>1 and not source else
-                f'{self.path.stem}_laser.nc' if self.path else 'novy.nc')
+        if test: name='test_laseru.nc'
+        elif source: name=self.path.name if self.path else 'novy.nc'
+        elif self.output_path: name=self.output_path.name
+        else:
+            origin=self.documents[0]['path'] if self.documents else self.path
+            name=output_filename(origin,cnc='(CNC PCB' in output)
         path = filedialog.asksaveasfilename(title='Uložit NC',defaultextension='.nc',initialfile=name,
                                           initialdir=self.last_directory or str(self.path.parent) if self.path else self.last_directory or str(Path(sys.executable).parent if getattr(sys,'frozen',False) else Path(__file__).parent),
                                           filetypes=[('NC soubor','*.nc'),('G-code','*.gcode')])
@@ -1010,6 +1124,11 @@ class App:
     def build_test(self, parent):
         settings = ttk.Frame(parent,padding=(3,2))
         settings.pack(fill='x')
+        settings.columnconfigure((0,1),weight=1,uniform='halves')
+        panel=ttk.Frame(settings,padding=4,relief='groove',borderwidth=1)
+        panel.grid(row=0,column=0,sticky='nsew',padx=(0,3))
+        options=ttk.Frame(settings,padding=4,relief='groove',borderwidth=1)
+        options.grid(row=0,column=1,sticky='nsew')
         fields = [('tx','Počátek X [mm]','0'),('ty','Počátek Y [mm]','0'),
                   ('tw','Šířka plochy [mm]','30'),('th','Výška plochy [mm]','20'),
                   ('cols','Sloupce (výkony)','3'),('rows','Řádky (rychlosti)','3'),
@@ -1017,29 +1136,20 @@ class App:
                   ('smin','Výkon S od',''),('smax','Výkon S do',''),
                   ('fmin','Rychlost od [mm/min]','1500'),('fmax','Rychlost do [mm/min]','2500')]
         for index,(key,title,default) in enumerate(fields):
-            self.entry(settings,key,title,default,1+index//3,(index%3)*2)
-        self.combo(settings,'tlaser','Laser',['M3','M4'],'M3',0,4)
-        # Match the laser selector's outer width to the numeric entries.
-        laser_choice=settings.grid_slaves(row=0,column=5)[0]
-        laser_choice.configure(width=10)
-        options=ttk.LabelFrame(settings,text='Vzorky a obrysy',padding=(5,2))
-        options.grid(row=0,column=6,rowspan=5,sticky='new',padx=(0,3))
-        settings.columnconfigure(6,weight=1)
-        self.combo(options,'tpattern','Typ testu',['Plošná matice','Matice se spoji','Spoje: 1/2/3 průjezdy'],'Plošná matice',0,0)
-        self.vars['trace_widths']=tk.StringVar(value='0,3; 0,5; 0,8; 1')
-        ttk.Label(options,text='Šířky spojů [mm]').grid(row=1,column=0,sticky='w')
-        ttk.Entry(options,textvariable=self.vars['trace_widths'],width=20).grid(row=1,column=1,sticky='w',padx=(0,12))
-        self.combo(options,'tborder','Obrysy celého políčka',['0','1','2'],'2',2,0)
-        self.entry(options,'tborder_width','Šířka stopy obrysu [mm]','0.2',3,0)
-        ttk.Label(options,text='Překrytí obrysů 20 %').grid(row=4,column=0,columnspan=2,sticky='w')
+            self.entry(panel,key,title,default,index//2,(index%2)*2)
+        self.entry(options,'trace_widths','Šířky spojů [mm]','0,3; 0,5; 0,8; 1',0,0)
+        self.combo(options,'tborder','Obrysy pole',['0','1','2'],'2',1,0)
+        self.entry(options,'tborder_width','Stopa obrysu [mm]','0.2',2,0)
+        self.entry(options,'negative_gap','Mezera sloupečků [mm]','0.5',3,0)
+        self.combo(options,'tlaser','Laser',['M3','M4'],'M3',1,2)
         self.vars['tnegative']=tk.BooleanVar(value=False)
-        ttk.Checkbutton(settings,text='Negativní rezist',variable=self.vars['tnegative']).grid(row=0,column=0,columnspan=2,sticky='w')
-        self.entry(settings,'negative_gap','Mezera sloupečků [mm]','0.5',0,2)
-        def update_technology(*args):
-            negative=self.vars['tnegative'].get()
-            options.grid_slaves(row=0,column=1)[0].configure(state='disabled' if negative else 'readonly')
-        self.vars['tnegative'].trace_add('write',update_technology)
-        update_technology()
+        ttk.Checkbutton(options,text='Negativní rezist',variable=self.vars['tnegative']).grid(row=2,column=2,columnspan=2,sticky='w')
+        for frame in (panel,options):
+            for widget in frame.winfo_children():
+                widget.grid_configure(padx=(0,4))
+                if isinstance(widget,(ttk.Entry,ttk.Combobox)): widget.configure(width=8)
+        options.grid_slaves(row=0,column=1)[0].configure(width=24)
+        options.grid_slaves(row=0,column=1)[0].grid_configure(columnspan=3)
         bar = ttk.Frame(parent); bar.pack(fill='x',pady=3)
         ttk.Button(bar,text='Vytvořit test',command=self.generate_test).pack(side='left')
         self.test_save = ttk.Button(bar,text='Uložit test NC…',command=lambda:self.save(True),state='disabled'); self.test_save.pack(side='left',padx=8)
@@ -1051,7 +1161,7 @@ class App:
         self.legend = ScrolledText(parent,height=4,wrap='word',state='disabled',font=('Consolas',9))
         for key,_,_ in fields:
             self.vars[key].trace_add('write',lambda *args:self.invalidate(True))
-        for key in ('tlaser','tpattern','trace_widths','tborder','tborder_width','tnegative','negative_gap'):
+        for key in ('tlaser','trace_widths','tborder','tborder_width','negative_gap','tnegative'):
             self.vars[key].trace_add('write',lambda *args:self.invalidate(True))
 
     def generate_test(self):
@@ -1065,24 +1175,20 @@ class App:
             laser = self.vars['tlaser'].get()
             negative=self.vars['tnegative'].get()
             border_count=self.number('tborder')
-            negative_gap=self.number('negative_gap') if negative else .5
+            negative_gap=self.number('negative_gap')
             if border_count not in (0,1,2): raise NCError('Počet obrysů musí být 0, 1 nebo 2.')
             border_count=int(border_count)
             border_width=self.number('tborder_width') if border_count else .2
-            trace_widths = None
             pass_mode = None
-            if not negative and self.vars['tpattern'].get() == 'Spoje: 1/2/3 průjezdy':
-                pass_mode = 'adjacent'
-            if negative or self.vars['tpattern'].get() != 'Plošná matice':
-                try:
-                    trace_widths=[float(v.replace(',','.')) for v in re.split(r'[;\s]+',self.vars['trace_widths'].get().strip()) if v]
-                except ValueError: raise NCError('Šířky spojů: zadejte čísla oddělená středníkem, například 0,3; 0,5; 0,8; 1.')
-                if not trace_widths: raise NCError('Vyplňte alespoň jednu šířku spoje.')
+            try:
+                trace_widths=[float(v.replace(',','.')) for v in re.split(r'[;\s]+',self.vars['trace_widths'].get().strip()) if v]
+            except ValueError: raise NCError('Šířky spojů: zadejte čísla oddělená středníkem, například 0,3; 0,5; 0,8; 1.')
+            if not trace_widths: raise NCError('Vyplňte alespoň jednu šířku spoje.')
         except NCError as e: messagebox.showerror('Nastavení testu',str(e)); return
         if not self.allow_replace(('test',)): return
         self.invalidate(True)
         def job():
-            output,legend = test_pattern(*values,laser=laser,trace_widths=trace_widths,trace_pass_mode=pass_mode,border_count=border_count,border_width=border_width,negative=negative,negative_gap=negative_gap)
+            output,legend = test_pattern(*values,laser=laser,trace_widths=trace_widths,trace_pass_mode=pass_mode,border_count=border_count,border_width=border_width,negative=negative,negative_gap=negative_gap,comparison=True)
             return output,legend,parse_nc(output,'spindle')
         def done(result):
             self.test_output,legend,drawing = result
@@ -1093,7 +1199,7 @@ class App:
             self.test_editor.title.configure(text='Testovací G-code • neuloženo')
             self.test_editor.path.set_path(None)
             self.test_preview.set_drawing(drawing)
-            note=(('Spoje zleva [mm]: ' if negative else 'Spoje zdola [mm]: ')+' / '.join(fmt(v) for v in trace_widths)+'\n') if trace_widths else ''
+            note=('Spoje zleva [mm]: '+' / '.join(fmt(v) for v in trace_widths)+'\n') if trace_widths else ''
             if negative: note+='Negativní rezist: každá šířka má sloupeček; mezery = šířka. D '+fmt(values[7])+' mm; odstup D/2; krok '+fmt(.8*values[7])+' mm. Počty a polohy drah jsou v hlavičce NC.\n'
             if pass_mode: note+=f'Vzorky zleva: 1 / 2 / 3 dráhy; první odstup {fmt(values[7]/2)} mm; další krok {fmt(.8*values[7])} mm\n'
             if border_count: note+=f'Obrysy celého pole: {border_count}; šířka stopy {fmt(border_width)} mm; překrytí 20 %; rozteč {fmt(.8*border_width)} mm\n'

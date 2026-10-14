@@ -1,16 +1,49 @@
-name: Python tests
+name: Test and build Windows EXE
 on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 jobs:
-  test:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m unittest -v test_nc_core test_features test_contours test_negative test_preferences
+      - run: python -m unittest -v test_nc_core test_features test_contours test_negative test_preferences test_milling test_feedback test_output_naming
       - run: python test_gui_smoke.py
       - run: python test_contour_gui.py
       - run: python test_preview_fit.py
+      - run: python test_milling_gui.py
+      - run: python test_feedback_gui.py
+      - run: python test_mouse_gui.py
+      - run: python -m pip install pyinstaller==6.22.3
+      - run: python build_exe.py
+      - name: SHA256
+        shell: pwsh
+        run: |
+          $digest = (Get-FileHash -Algorithm SHA256 dist/PrevodnikNC.exe).Hash.ToLower()
+          "$digest  PrevodnikNC.exe" | Set-Content -Encoding utf8 dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PrevodnikNC-windows-x64
+          path: |
+            dist/PrevodnikNC.exe
+            dist/SHA256SUMS.txt
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: PrevodnikNC-windows-x64
+          path: dist
+      - name: Publish verified EXE
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/PrevodnikNC.exe dist/SHA256SUMS.txt --verify-tag --title "PrevodnikNC $RELEASE_TAG — Laser & CNC" --notes-file RELEASE_NOTES.md

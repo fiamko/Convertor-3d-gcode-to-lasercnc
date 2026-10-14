@@ -127,35 +127,30 @@ with tempfile.TemporaryDirectory() as temp:
         assert target.read_text(encoding='utf-8').startswith('; vlastní poznámka')
         assert not app.dirty['test']
         app.vars['th'].set('24')
-        app.vars['tpattern'].set('Matice se spoji')
+        assert 'tpattern' not in app.vars and 'tnegative' in app.vars
         app.vars['trace_widths'].set('0,3; 0,5; 0,8; 1')
-        app.generate_test(); root.update()
-        assert '(0.3 / 0.5 / 0.8 / 1)' in app.test_editor.text.get('1.0','end-1c')
-        assert 'Spoje zdola' in app.legend.get('1.0','end-1c')
         app.vars['th'].set('30')
-        app.vars['tpattern'].set('Spoje: 1/2/3 průjezdy')
         for count in ('1','2'):
             app.vars['tborder'].set(count)
             app.vars['tborder_width'].set('0,2')
             with patch('PrevodnikNC.messagebox.askyesno',return_value=True): app.generate_test()
             root.update()
-            assert 'Vzorky zleva: 1 / 2 / 3 dráhy' in app.legend.get('1.0','end-1c')
-            assert sum(s.burn for s in app.test_preview.drawing.strokes)==432+9*int(count)
+            assert 'Sirky sloupecku zleva v mm: 0.3 / 0.5 / 0.8 / 1' in app.test_output
+            assert 'Sloupecek 1: W 0.3 mm / mezera 0.3 mm' in app.test_output
+            assert 'obrys celeho pole' in app.test_output
             assert 'rozteč 0.16 mm' in app.legend.get('1.0','end-1c')
-        assert app.vars['th'].get()=='30'
+        positive_points=[s.points for s in app.test_preview.drawing.strokes if s.burn]
+        assert 'Barva / pozitivni rezist' in app.test_output
         app.vars['tnegative'].set(True)
         with patch('PrevodnikNC.messagebox.askyesno',return_value=True): app.generate_test()
         root.update()
         assert 'Negativni rezist' in app.test_output
-        assert 'obrys celeho pole' in app.test_output
+        assert positive_points==[s.points for s in app.test_preview.drawing.strokes if s.burn]
+        # Equal-width lit/unlit stripes swap copper/gap meaning with technology.
         assert app.vars['th'].get()=='30'
         assert app.vars['tw'].get()=='35'
-        assert 'Sirky sloupecku zleva' in app.test_output
-        assert 'Negativní rezist' in app.legend.get('1.0','end-1c')
         assert app.before.canvas.bind('<B3-Motion>')
         assert not app.before.canvas.bind('<B1-Motion>')
-        app.vars['tnegative'].set(False)
-        assert 'tpasses' not in app.vars
         app.test_editor.copy_all()
         assert root.clipboard_get() == app.test_editor.text.get('1.0','end-1c')
         app.test_editor.text.insert('1.0','; zachovat\n'); root.update()

@@ -1,13 +1,14 @@
 """Conservative Gerber clearance analysis; standard library only.
 
 Supports positive, dark-only Gerber with circular-aperture linear and G75 arc draws, C/R/O flashes
-and the explicitly verified KiCad RoundRect macro. Unsupported image operations
+linear filled regions and the explicitly verified KiCad RoundRect macro. Unsupported image operations
 fail closed, never silently approximate a different copper image.
 """
 from dataclasses import dataclass
 import math
 import re
 import statistics
+import heapq
 from pathlib import Path
 from nc_core import NCError, Drawing
 
@@ -101,19 +102,85 @@ def find_copper_file(nc_path):
     return matches[0] if len(matches)==1 else None
 
 
+class CopperRegion:
+    kind = 'region'
+
+    def __init__(self, points):
+        if len(points)<4 or points[0]!=points[-1]:
+            raise NCError('Gerber: vyplněná oblast musí mít uzavřený obrys.')
+        self.points = tuple(points)
+        # KiCad connects holes to the outer contour with a retraced cut-in.
+        # These paired edges are not copper boundaries.
+        edges = {}
+        for a,b in zip(points,points[1:]):
+            if a==b: continue
+            if edges.get((b,a),0):
+                edges[b,a]-=1
+            else: edges[a,b]=edges.get((a,b),0)+1
+        self.edges = tuple(edge for edge,count in edges.items() for _ in range(count))
+        if len(self.edges)<3: raise NCError('Gerber: prázdná vyplněná oblast.')
+
+    def bounds(self):
+        return (min(p[0] for p in self.points),min(p[1] for p in self.points),
+                max(p[0] for p in self.points),max(p[1] for p in self.points))
+
+    def distance(self, point):
+        x,y=point; inside=False; best=float('inf')
+        for a,b in self.edges:
+            best=min(best,CopperShape('capsule',a,b,0).distance(point))
+            if (a[1]>y)!=(b[1]>y) and x<(b[0]-a[0])*(y-a[1])/(b[1]-a[1])+a[0]:
+                inside=not inside
+        return -best if inside else best
+
+
 class Copper:
     def __init__(self, shapes):
         self.shapes = shapes
         self.boxes = [s.bounds() for s in shapes]
+        self.nodes=[]
+        def build(indices):
+            bounds=(min(self.boxes[i][0] for i in indices),min(self.boxes[i][1] for i in indices),
+                    max(self.boxes[i][2] for i in indices),max(self.boxes[i][3] for i in indices))
+            node=len(self.nodes); self.nodes.append(None)
+            if len(indices)<=8:
+                self.nodes[node]=(bounds,indices,None)
+            else:
+                axis=0 if bounds[2]-bounds[0]>=bounds[3]-bounds[1] else 1
+                indices.sort(key=lambda i:self.boxes[i][axis]+self.boxes[i][axis+2])
+                mid=len(indices)//2
+                children=(build(indices[:mid]),build(indices[mid:]))
+                self.nodes[node]=(bounds,None,children)
+            return node
+        self.root=build(list(range(len(shapes)))) if shapes else None
 
     def distance(self, point):
-        # Bounding-box pruning: shapes cannot be closer than their bounding box.
-        x,y = point; best = float('inf')
-        for shape,(x0,y0,x1,y1) in zip(self.shapes,self.boxes):
-            dx,dy = max(x0-x,0,x-x1),max(y0-y,0,y-y1)
-            if best > 0 and dx*dx+dy*dy < best*best:
-                best = min(best,shape.distance(point))
-            if best <= 0: return best
+        # Best-first bounding-box search; exact shape distances are unchanged.
+        x,y=point
+        def lower(box):
+            x0,y0,x1,y1=box
+            dx=max(x0-x,0,x-x1); dy=max(y0-y,0,y-y1)
+            return dx*dx+dy*dy
+        if self.root is None: return float('inf')
+        best=float('inf'); pending=[(0,self.root)]
+        while pending:
+            bound,node=heapq.heappop(pending)
+            if bound>=best*best: continue
+            box,indices,children=self.nodes[node]
+            if indices is not None:
+                for i in indices:
+                    if lower(self.boxes[i])<best*best:
+                        best=min(best,self.shapes[i].distance(point))
+                        if best<=0:
+                            # Preserve the former signed result for overlapping shapes.
+                            for shape,box in zip(self.shapes,self.boxes):
+                                if lower(box)==0:
+                                    value=shape.distance(point)
+                                    if value<=0: return value
+                            return best
+            else:
+                for child in children:
+                    bound=lower(self.nodes[child][0])
+                    if bound<best*best: heapq.heappush(pending,(bound,child))
         return best
 
 
@@ -130,6 +197,7 @@ def parse_copper(text):
     decimals = None; unit = None; selected = None; x = y = None
     operation = None; copper = False; ended = False
     interpolation = 1; multi_quadrant = False
+    region = None
     # Keep extended blocks intact (macros contain embedded '*' delimiters).
     tokens = re.findall(r'%[^%]*%|[^%*]+\*',text)
     residue = re.sub(r'%[^%]*%|[^%*]+\*','',text).strip()
@@ -179,7 +247,13 @@ def parse_copper(text):
         if cmd == 'G75': multi_quadrant=True; continue
         if cmd == 'G74':
             raise NCError('Gerber: starší oblouky G74 nejsou podporovány; exportujte v režimu G75.')
-        modal=re.match(r'^G0?([123])',cmd)
+        if cmd == 'G36':
+            if region is not None: raise NCError('Gerber: vnořená vyplněná oblast.')
+            region=[]; continue
+        if cmd == 'G37':
+            if region is None: raise NCError('Gerber: G37 bez začátku oblasti G36.')
+            shapes.append(CopperRegion(region)); region=None; continue
+        modal=re.match(r'^G0?([123])(?=[XYIJD]|$)',cmd)
         if modal:
             interpolation=int(modal[1]); cmd=cmd[modal.end():]
             if not cmd: continue
@@ -198,6 +272,17 @@ def parse_copper(text):
         if (match[3] is not None or match[4] is not None) and (operation!=1 or interpolation==1):
             raise NCError('Gerber: I/J mimo kreslení oblouku.')
         if nx is None or ny is None or operation is None: raise NCError('Gerber: neúplná poloha/operace.')
+        if region is not None:
+            if operation==2:
+                if region: raise NCError('Gerber: více samostatných obrysů v oblasti není podporováno.')
+                region.append((nx,ny))
+            elif operation==1:
+                if not region: raise NCError('Gerber: oblasti chybí počáteční D02.')
+                if interpolation!=1: raise NCError('Gerber: obloukový obrys vyplněné oblasti není podporován.')
+                region.append((nx,ny))
+            else: raise NCError('Gerber: D03 uvnitř vyplněné oblasti.')
+            x,y=nx,ny
+            continue
         if operation in (1,3):
             if selected is None: raise NCError('Gerber: není vybrána apertura.')
             kind,v = selected
@@ -219,6 +304,7 @@ def parse_copper(text):
                 shapes.append(CopperShape('capsule',(nx-dx,ny-dy),(nx+dx,ny+dy),r))
             else: shapes.append(CopperShape('box',(nx+v[0],ny+v[1]),(v[2],v[3]),v[4]))
         x,y = nx,ny
+    if region is not None: raise NCError('Gerber: neukončená vyplněná oblast G36/G37.')
     if not ended or not copper or not shapes:
         raise NCError('Vyberte úplný pozitivní Gerber mědi (FileFunction Copper).')
     return Copper(shapes)
@@ -294,7 +380,9 @@ def copper_outlines(copper):
     display=[part for shape in copper.shapes for part in (shape.display_segments() if shape.kind=='arc' else [shape])]
     for shape in display:
         points=[]
-        if shape.kind=='capsule':
+        if shape.kind=='region':
+            points=list(shape.points)
+        elif shape.kind=='capsule':
             ax,ay=shape.a; bx,by=shape.b
             angle=math.atan2(by-ay,bx-ax)
             for cx,cy,start in ((bx,by,angle-math.pi/2),(ax,ay,angle+math.pi/2)):

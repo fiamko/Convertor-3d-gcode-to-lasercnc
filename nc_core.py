@@ -15,6 +15,7 @@ class Stroke:
     feed: float = 0
     power: float = 0
     rapid: bool = True
+    source_lines: list = field(default_factory=list)
 
 
 @dataclass
@@ -231,7 +232,7 @@ def parse_nc(text, mode='auto', threshold=0.0, drill_diameter=0.0):
                 if x is None or y is None:
                     if motion != 0:
                         raise NCError("První XY poloha musí být zadána rychloposuvem G0.")
-                    drawing.strokes.append(Stroke([end], False, feed, power))
+                    drawing.strokes.append(Stroke([end], False, feed, power, source_lines=[number]))
                 else:
                     start = (x, y)
                     points = [start]
@@ -250,8 +251,9 @@ def parse_nc(text, mode='auto', threshold=0.0, drill_diameter=0.0):
                                 and last and last.burn == burn and last.feed == feed
                                 and last.power == power and last.rapid == (motion == 0) and last.points[-1] == start):
                             last.points.extend(points[1:])
+                            last.source_lines.append(number)
                         else:
-                            drawing.strokes.append(Stroke(points, burn, feed, power, motion == 0))
+                            drawing.strokes.append(Stroke(points, burn, feed, power, motion == 0, [number]))
                 split = False
             if 'Z' in vals and z != nz:
                 split = True
@@ -380,7 +382,8 @@ def negative_fill_lines(width, diameter):
 
 def test_pattern(x, y, width, height, columns, rows, gap, spacing,
                  min_power, max_power, min_feed, max_feed, laser='M3', trace_widths=None,
-                 trace_pass_mode=None, border_count=0, border_width=.2, negative=False, negative_gap=.5):
+                 trace_pass_mode=None, border_count=0, border_width=.2, negative=False, negative_gap=.5, comparison=False):
+    column_pattern = negative or comparison
     for v, label in ((width, 'Šířka'), (height, 'Výška'), (spacing, 'Rozteč čar'),
                      (min_power, 'Výkon od'), (max_power, 'Výkon do'),
                      (min_feed, 'Rychlost od'), (max_feed, 'Rychlost do')):
@@ -400,7 +403,7 @@ def test_pattern(x, y, width, height, columns, rows, gap, spacing,
         raise NCError('Zadané mezery se nevejdou do plochy obrazce.')
     if type(border_count)!=int or border_count not in (0,1,2):
         raise NCError('Počet obrysů musí být 0, 1 nebo 2.')
-    if negative:
+    if column_pattern:
         trace_pass_mode=None
     margin=0
     if border_count:
@@ -409,9 +412,9 @@ def test_pattern(x, y, width, height, columns, rows, gap, spacing,
         border_step=.8*border_width
         margin=(border_count-1)*border_step+border_width/2
     # Reserve the whole nominal beam footprint inside the requested area.
-    if not negative and border_count and (rows>1 or columns>1) and gap+1e-9<2*margin:
+    if not column_pattern and border_count and (rows>1 or columns>1) and gap+1e-9<2*margin:
         raise NCError(f'Obrysy se nevejdou do oddělení polí. Zvětšete mezeru polí alespoň na {math.ceil(2*margin*100)/100:g} mm.')
-    if negative:
+    if column_pattern:
         # Each frame fits inside its own fixed cell; never enlarge the board.
         cell_width,cell_height=cw,ch
         cw-=2*margin; ch-=2*margin
@@ -426,14 +429,16 @@ def test_pattern(x, y, width, height, columns, rows, gap, spacing,
         positive(value,'Šířka spoje')
         if value<.0001: raise NCError('Šířka spoje je menší než přesnost výstupu 0,0001 mm.')
     notes=[]; groups=[]
-    if negative:
+    if column_pattern:
         if not trace_widths:
             raise NCError('Negativní test vyžaduje šířky spojů.')
         positive(negative_gap, 'Mezera sloupečků', zero=True)
         length=(cw-(len(trace_widths)-1)*negative_gap)/len(trace_widths)
         if length <= spacing:
             raise NCError('Sloupečky se nevejdou do šířky pole. Zmenšete jejich mezeru, D nebo počet šířek spojů.')
-        notes=['(Negativni rezist: laser osvituje budouci med.)',
+        notes=[('(Negativni rezist: laser osvituje budouci med.)' if negative else
+                '(Barva / pozitivni rezist: laser odkryva budouci mezery; neosvicene pruhy zustanou medi.)'),
+               '(Porovnani 1:1: osviceny i neosviceny pruh maji nominalni sirku W.)',
                '(Sirky sloupecku zleva v mm: '+' / '.join(fmt(v) for v in trace_widths)+')',
                f'(Plocha {fmt(width)} x {fmt(height)} mm; pole {fmt(cell_width)} x {fmt(cell_height)} mm.)',
                f'(Prostor uvnitr ramu {fmt(cw)} x {fmt(ch)} mm; mezera sloupecku {fmt(negative_gap)} mm.)',
@@ -512,7 +517,7 @@ def test_pattern(x, y, width, height, columns, rows, gap, spacing,
     if border_count:
         notes += [f'(Oddeleni celeho pole S/F: {border_count} uzavrene obrysy, prekryti stop 20 procent)',
                   f'(Sirka stopy obrysu {fmt(border_width)} mm; roztec obrysu {fmt(border_step)} mm)',
-                  ('(Ram pouze kolem celeho S/F pole.)' if negative else '(Vnitrni propojeni vzorku 1/2/3 zustavaji zachovana.)'),
+                  ('(Ram pouze kolem celeho S/F pole.)' if column_pattern else '(Vnitrni propojeni vzorku 1/2/3 zustavaji zachovana.)'),
                   '(Vnejsi obrysy vcetne zadane sirky stopy zustavaji uvnitr zadane plochy.)']
     out=['(PrevodnikNC - test matrix, columns S / rows F)','G21','G90','G17','G94','M5']
     legend=[]
@@ -524,7 +529,7 @@ def test_pattern(x, y, width, height, columns, rows, gap, spacing,
             label=f'R{row+1} C{col+1}: S{fmt(power)} / F{fmt(feed)}'
             legend.append(label); out.append(f'({label})')
             for group,offset,length,lines,zigzag in groups:
-                if trace_pass_mode or negative: out.append(f'({label} / {group})')
+                if trace_pass_mode or column_pattern: out.append(f'({label} / {group})')
                 for n,line_y in enumerate(lines):
                     a,b=(xx+offset,xx+offset+length)
                     if zigzag and n%2: a,b=b,a

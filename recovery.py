@@ -31,6 +31,7 @@ def read_snapshot(path):
     if not isinstance(data,dict) or data.get('version')!=1: raise ValueError('Neplatná verze zálohy.')
     for key in ('input','output','test','recipe_name','recipe_note'):
         if not isinstance(data.get(key),str): raise ValueError('Neplatný text v záloze.')
+    if not isinstance(data.get('mill',''),str): raise ValueError('Neplatný CNC test v záloze.')
     docs=data.get('documents')
     if not isinstance(docs,list): raise ValueError('Neplatný seznam souborů.')
     for doc in docs:

@@ -17,6 +17,7 @@ app.vars['fmax'].set('3000')
 app.vars['mx'].set(True)
 app.vars['contour_count'].set('2')
 app.vars['tborder'].set('2')
+app.vars['negative_gap'].set('0.7')
 app.vars['tnegative'].set(True)
 app.vars['trace_widths'].set('0,3; 0,5; 0,8; 1')
 app.recipe_name.set('PCB test')
@@ -30,6 +31,7 @@ assert app.vars['fmax'].get()=='3000'
 assert app.vars['mx'].get() is True
 assert app.vars['contour_count'].get()=='2'
 assert app.vars['tborder'].get()=='2'
+assert app.vars['negative_gap'].get() == '0.7'
 assert app.vars['tnegative'].get() is True
 assert app.vars['trace_widths'].get()=='0,3; 0,5; 0,8; 1'
 assert app.recipe_name.get()=='PCB test'
@@ -38,7 +40,7 @@ assert app.before.travel.get() is True
 assert app.notebook.index('current')==1
 assert not app.documents
 assert not app.test_output""")
-            path=Path(folder)/'PrevodnikNC'/'nastaveni.json'
+            path=Path(folder)/'UpravaNC_Laser_CNC'/'nastaveni.json'
             path.write_text('{bad',encoding='utf-8')
             run("assert app.vars['power'].get()==''\nassert 'nelze načíst' in app.status.get()")
             path.write_text('{"version":1,"values":{"laser":"BAD","mx":"false","power":"380"}}',encoding='utf-8')
